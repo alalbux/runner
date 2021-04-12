@@ -49,25 +49,25 @@ namespace GitHub.Runner.Worker.Handlers
 
             // Create the nested steps
             var nestedSteps = new List<IStep>();
-            foreach (Pipelines.ActionStep nestedStepData in Data.Steps)
+            foreach (Pipelines.ActionStep stepData in Data.Steps)
             {
                 var actionRunner = HostContext.CreateService<IActionRunner>();
-                actionRunner.Action = nestedStepData;
+                actionRunner.Action = stepData;
                 actionRunner.Stage = stage;
-                actionRunner.Condition = nestedStepData.Condition;
+                actionRunner.Condition = stepData.Condition;
 
-                var nestedStep = ExecutionContext.CreateCompositeStep(childScopeName, actionRunner, inputsData, Environment);
+                var step = ExecutionContext.CreateCompositeStep(childScopeName, actionRunner, inputsData, Environment);
 
                 // Shallow copy github context
-                var gitHubContext = nestedStep.ExecutionContext.ExpressionValues["github"] as GitHubContext;
+                var gitHubContext = step.ExecutionContext.ExpressionValues["github"] as GitHubContext;
                 ArgUtil.NotNull(gitHubContext, nameof(gitHubContext));
                 gitHubContext = gitHubContext.ShallowCopy();
-                nestedStep.ExecutionContext.ExpressionValues["github"] = gitHubContext;
+                step.ExecutionContext.ExpressionValues["github"] = gitHubContext;
 
                 // Set GITHUB_ACTION_PATH
-                nestedStep.ExecutionContext.SetGitHubContext("action_path", ActionDirectory);
+                step.ExecutionContext.SetGitHubContext("action_path", ActionDirectory);
 
-                nestedSteps.Add(nestedStep);
+                nestedSteps.Add(step);
             }
 
             try
