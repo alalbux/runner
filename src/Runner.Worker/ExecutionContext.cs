@@ -254,8 +254,7 @@ namespace GitHub.Runner.Worker
         }
 
         /// <summary>
-        /// Helper function used in CompositeActionHandler::RunAsync to
-        /// add a child node, aka a step, to the current job to the Root.JobSteps based on the location.
+        /// Creates a child step within a composite action
         /// </summary>
         public IStep CreateCompositeStep(
             string scopeName,
@@ -266,19 +265,6 @@ namespace GitHub.Runner.Worker
             step.ExecutionContext = Root.CreateChild(_record.Id, _record.Name, _record.Id.ToString("N"), scopeName, step.Action.ContextName, logger: _logger, insideComposite: true, cancellationTokenSource: CancellationTokenSource.CreateLinkedTokenSource(_cancellationTokenSource.Token));
             step.ExecutionContext.ExpressionValues["inputs"] = inputsData;
             step.ExecutionContext.ExpressionValues["steps"] = Global.StepsContext.GetScope(step.ExecutionContext.GetFullyQualifiedContextName());
-
-            // Add the composite action environment variables to each step.
-#if OS_WINDOWS
-            var envContext = new DictionaryContextData();
-#else
-            var envContext = new CaseSensitiveDictionaryContextData();
-#endif
-            foreach (var pair in envData)
-            {
-                envContext[pair.Key] = new StringContextData(pair.Value ?? string.Empty);
-            }
-            step.ExecutionContext.ExpressionValues["env"] = envContext;
-
             return step;
         }
 
