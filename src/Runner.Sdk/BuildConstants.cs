@@ -4,7 +4,7 @@ namespace GitHub.Runner.Sdk
     {
         public static class Source
         {
-            public static readonly string CommitHash = "a95b8808db9c1c315889b3e5072396836372d049";
+            public static readonly string CommitHash = "83bafa4ab151239450460ee7cc906ddfba409571";
         }
 
         public static class RunnerPackage

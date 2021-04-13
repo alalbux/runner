@@ -32,55 +32,54 @@ namespace GitHub.Runner.Worker.Handlers
             ArgUtil.NotNull(Inputs, nameof(Inputs));
             ArgUtil.NotNull(Data.Steps, nameof(Data.Steps));
 
-            // Inputs of the composite step
-            var inputsData = new DictionaryContextData();
-            foreach (var i in Inputs)
-            {
-                inputsData[i.Key] = new StringContextData(i.Value);
-            }
-
-            // Temporary hack until after M271-ish. After M271-ish the server will never send an empty
-            // context name. Generated context names start with "__"
-            var childScopeName = ExecutionContext.GetFullyQualifiedContextName();
-            if (string.IsNullOrEmpty(childScopeName))
-            {
-                childScopeName = $"__{Guid.NewGuid()}";
-            }
-
-            // Create the nested steps
-            var nestedSteps = new List<IStep>();
-            foreach (Pipelines.ActionStep stepData in Data.Steps)
-            {
-                var actionRunner = HostContext.CreateService<IActionRunner>();
-                actionRunner.Action = stepData;
-                actionRunner.Stage = stage;
-                actionRunner.Condition = stepData.Condition;
-
-                var step = ExecutionContext.CreateCompositeStep(childScopeName, actionRunner, inputsData, Environment);
-
-                // Shallow copy github context
-                var gitHubContext = step.ExecutionContext.ExpressionValues["github"] as GitHubContext;
-                ArgUtil.NotNull(gitHubContext, nameof(gitHubContext));
-                gitHubContext = gitHubContext.ShallowCopy();
-                step.ExecutionContext.ExpressionValues["github"] = gitHubContext;
-
-                // Set GITHUB_ACTION_PATH
-                step.ExecutionContext.SetGitHubContext("action_path", ActionDirectory);
-
-                nestedSteps.Add(step);
-            }
-
             try
             {
-                // This is where we run each step.
+                // Inputs of the composite step
+                var inputsData = new DictionaryContextData();
+                foreach (var i in Inputs)
+                {
+                    inputsData[i.Key] = new StringContextData(i.Value);
+                }
+
+                // Temporary hack until after M271-ish. After M271-ish the server will never send an empty
+                // context name. Generated context names start with "__"
+                var childScopeName = ExecutionContext.GetFullyQualifiedContextName();
+                if (string.IsNullOrEmpty(childScopeName))
+                {
+                    childScopeName = $"__{Guid.NewGuid()}";
+                }
+
+                // Create nested steps
+                var nestedSteps = new List<IStep>();
+                foreach (Pipelines.ActionStep stepData in Data.Steps)
+                {
+                    var step = HostContext.CreateService<IActionRunner>();
+                    step.Action = stepData;
+                    step.Stage = stage;
+                    step.Condition = stepData.Condition;
+                    step.ExecutionContext = ExecutionContext.CreateEmbeddedChild(childScopeName, stepData.ContextName);
+                    step.ExecutionContext.ExpressionValues["inputs"] = inputsData;
+                    step.ExecutionContext.ExpressionValues["steps"] = ExecutionContext.Global.StepsContext.GetScope(childScopeName);
+
+                    // Shallow copy github context
+                    var gitHubContext = step.ExecutionContext.ExpressionValues["github"] as GitHubContext;
+                    ArgUtil.NotNull(gitHubContext, nameof(gitHubContext));
+                    gitHubContext = gitHubContext.ShallowCopy();
+                    step.ExecutionContext.ExpressionValues["github"] = gitHubContext;
+
+                    // Set GITHUB_ACTION_PATH
+                    step.ExecutionContext.SetGitHubContext("action_path", ActionDirectory);
+
+                    nestedSteps.Add(step);
+                }
+
+                // Run nested steps
                 await RunStepsAsync(nestedSteps);
 
-                // Get the pointer of the correct "steps" object and pass it to the ExecutionContext so that we can process the outputs correctly
+                // Set outputs
                 ExecutionContext.ExpressionValues["inputs"] = inputsData;
-                ExecutionContext.ExpressionValues["steps"] = ExecutionContext.Global.StepsContext.GetScope(ExecutionContext.GetFullyQualifiedContextName());
-
-                ProcessCompositeActionOutputs();
-
+                ExecutionContext.ExpressionValues["steps"] = ExecutionContext.Global.StepsContext.GetScope(childScopeName);
+                ProcessOutputs();
                 ExecutionContext.Global.StepsContext.ClearScope(childScopeName);
             }
             catch (Exception ex)
@@ -92,7 +91,7 @@ namespace GitHub.Runner.Worker.Handlers
             }
         }
 
-        private void ProcessCompositeActionOutputs()
+        private void ProcessOutputs()
         {
             ArgUtil.NotNull(ExecutionContext, nameof(ExecutionContext));
 
@@ -142,8 +141,6 @@ namespace GitHub.Runner.Worker.Handlers
             foreach (IStep step in nestedSteps)
             {
                 Trace.Info($"Processing nested step: DisplayName='{step.DisplayName}'");
-
-                step.ExecutionContext.ExpressionValues["steps"] = ExecutionContext.Global.StepsContext.GetScope(step.ExecutionContext.ScopeName);
 
                 // Initialize env context
                 Trace.Info("Initialize Env context for nested step");
