@@ -1,6 +1,5 @@
 ## Features
 
-
 ## Bugs
   - Fixed an issue where docker containers failed to initialize (#977)
 
