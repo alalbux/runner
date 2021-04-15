@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
@@ -43,22 +44,13 @@ namespace GitHub.Runner.Worker
         string ResultCode { get; set; }
         TaskResult? CommandResult { get; set; }
         CancellationToken CancellationToken { get; }
-        List<ServiceEndpoint> Endpoints { get; }
+        GlobalContext Global { get; }
 
-        PlanFeatures Features { get; }
-        Variables Variables { get; }
         Dictionary<string, string> IntraActionState { get; }
-        IDictionary<String, IDictionary<String, String>> JobDefaults { get; }
         Dictionary<string, VariableValue> JobOutputs { get; }
-        IDictionary<String, String> EnvironmentVariables { get; }
-        IDictionary<String, ContextScope> Scopes { get; }
-        IList<String> FileTable { get; }
-        StepsContext StepsContext { get; }
+        ActionsEnvironmentReference ActionsEnvironment { get; }
         DictionaryContextData ExpressionValues { get; }
         IList<IFunctionInfo> ExpressionFunctions { get; }
-        List<string> PrependPath { get; }
-        ContainerInfo Container { get; set; }
-        List<ContainerInfo> ServiceContainers { get; }
         JobContext JobContext { get; }
 
         // Only job level ExecutionContext has JobSteps
@@ -69,13 +61,16 @@ namespace GitHub.Runner.Worker
 
         bool EchoOnActionCommand { get; set; }
 
+        bool InsideComposite { get; }
+
+        ExecutionContext Root { get; }
+
         // Initialize
         void InitializeJob(Pipelines.AgentJobRequestMessage message, CancellationToken token);
         void CancelToken();
-        IExecutionContext CreateChild(Guid recordId, string displayName, string refName, string scopeName, string contextName, Dictionary<string, string> intraActionState = null, int? recordOrder = null);
+        IExecutionContext CreateChild(Guid recordId, string displayName, string refName, string scopeName, string contextName, Dictionary<string, string> intraActionState = null, int? recordOrder = null, IPagingLogger logger = null, bool insideComposite = false, CancellationTokenSource cancellationTokenSource = null);
 
         // logging
-        bool WriteDebug { get; }
         long Write(string tag, string message);
         void QueueAttachFile(string type, string name, string filePath);
 
@@ -104,11 +99,13 @@ namespace GitHub.Runner.Worker
         // others
         void ForceTaskComplete();
         void RegisterPostJobStep(IStep step);
+        IStep CreateCompositeStep(string scopeName, IActionRunner step, DictionaryContextData inputsData, Dictionary<string, string> envData);
     }
 
     public sealed class ExecutionContext : RunnerService, IExecutionContext
     {
         private const int _maxIssueCount = 10;
+        private const int _throttlingDelayReportThreshold = 10 * 1000; // Don't report throttling with less than 10 seconds delay
 
         private readonly TimelineRecord _record = new TimelineRecord();
         private readonly Dictionary<Guid, TimelineRecord> _detailRecords = new Dictionary<Guid, TimelineRecord>();
@@ -139,21 +136,15 @@ namespace GitHub.Runner.Worker
         public string ContextName { get; private set; }
         public Task ForceCompleted => _forceCompleted.Task;
         public CancellationToken CancellationToken => _cancellationTokenSource.Token;
-        public List<ServiceEndpoint> Endpoints { get; private set; }
-        public Variables Variables { get; private set; }
         public Dictionary<string, string> IntraActionState { get; private set; }
-        public IDictionary<String, IDictionary<String, String>> JobDefaults { get; private set; }
         public Dictionary<string, VariableValue> JobOutputs { get; private set; }
-        public IDictionary<String, String> EnvironmentVariables { get; private set; }
-        public IDictionary<String, ContextScope> Scopes { get; private set; }
-        public IList<String> FileTable { get; private set; }
-        public StepsContext StepsContext { get; private set; }
+
+        public ActionsEnvironmentReference ActionsEnvironment { get; private set; }
         public DictionaryContextData ExpressionValues { get; } = new DictionaryContextData();
         public IList<IFunctionInfo> ExpressionFunctions { get; } = new List<IFunctionInfo>();
-        public bool WriteDebug { get; private set; }
-        public List<string> PrependPath { get; private set; }
-        public ContainerInfo Container { get; set; }
-        public List<ContainerInfo> ServiceContainers { get; private set; }
+
+        // Shared pointer across job-level execution context and step-level execution contexts
+        public GlobalContext Global { get; private set; }
 
         // Only job level ExecutionContext has JobSteps
         public Queue<IStep> JobSteps { get; private set; }
@@ -166,6 +157,7 @@ namespace GitHub.Runner.Worker
 
         public bool EchoOnActionCommand { get; set; }
 
+        public bool InsideComposite { get; private set; }
 
         public TaskResult? Result
         {
@@ -197,9 +189,7 @@ namespace GitHub.Runner.Worker
             }
         }
 
-        public PlanFeatures Features { get; private set; }
-
-        private ExecutionContext Root
+        public ExecutionContext Root
         {
             get
             {
@@ -263,17 +253,44 @@ namespace GitHub.Runner.Worker
             Root.PostJobSteps.Push(step);
         }
 
-        public IExecutionContext CreateChild(Guid recordId, string displayName, string refName, string scopeName, string contextName, Dictionary<string, string> intraActionState = null, int? recordOrder = null)
+        /// <summary>
+        /// Helper function used in CompositeActionHandler::RunAsync to
+        /// add a child node, aka a step, to the current job to the Root.JobSteps based on the location.
+        /// </summary>
+        public IStep CreateCompositeStep(
+            string scopeName,
+            IActionRunner step,
+            DictionaryContextData inputsData,
+            Dictionary<string, string> envData)
+        {
+            step.ExecutionContext = Root.CreateChild(_record.Id, _record.Name, _record.Id.ToString("N"), scopeName, step.Action.ContextName, logger: _logger, insideComposite: true, cancellationTokenSource: CancellationTokenSource.CreateLinkedTokenSource(_cancellationTokenSource.Token));
+            step.ExecutionContext.ExpressionValues["inputs"] = inputsData;
+            step.ExecutionContext.ExpressionValues["steps"] = Global.StepsContext.GetScope(step.ExecutionContext.GetFullyQualifiedContextName());
+
+            // Add the composite action environment variables to each step.
+#if OS_WINDOWS
+            var envContext = new DictionaryContextData();
+#else
+            var envContext = new CaseSensitiveDictionaryContextData();
+#endif
+            foreach (var pair in envData)
+            {
+                envContext[pair.Key] = new StringContextData(pair.Value ?? string.Empty);
+            }
+            step.ExecutionContext.ExpressionValues["env"] = envContext;
+
+            return step;
+        }
+
+        public IExecutionContext CreateChild(Guid recordId, string displayName, string refName, string scopeName, string contextName, Dictionary<string, string> intraActionState = null, int? recordOrder = null, IPagingLogger logger = null, bool insideComposite = false, CancellationTokenSource cancellationTokenSource = null)
         {
             Trace.Entering();
 
             var child = new ExecutionContext();
             child.Initialize(HostContext);
+            child.Global = Global;
             child.ScopeName = scopeName;
             child.ContextName = contextName;
-            child.Features = Features;
-            child.Variables = Variables;
-            child.Endpoints = Endpoints;
             if (intraActionState == null)
             {
                 child.IntraActionState = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -282,11 +299,6 @@ namespace GitHub.Runner.Worker
             {
                 child.IntraActionState = intraActionState;
             }
-            child.EnvironmentVariables = EnvironmentVariables;
-            child.JobDefaults = JobDefaults;
-            child.Scopes = Scopes;
-            child.FileTable = FileTable;
-            child.StepsContext = StepsContext;
             foreach (var pair in ExpressionValues)
             {
                 child.ExpressionValues[pair.Key] = pair.Value;
@@ -295,12 +307,8 @@ namespace GitHub.Runner.Worker
             {
                 child.ExpressionFunctions.Add(item);
             }
-            child._cancellationTokenSource = new CancellationTokenSource();
-            child.WriteDebug = WriteDebug;
+            child._cancellationTokenSource = cancellationTokenSource ?? new CancellationTokenSource();
             child._parentExecutionContext = this;
-            child.PrependPath = PrependPath;
-            child.Container = Container;
-            child.ServiceContainers = ServiceContainers;
             child.EchoOnActionCommand = EchoOnActionCommand;
 
             if (recordOrder != null)
@@ -311,9 +319,17 @@ namespace GitHub.Runner.Worker
             {
                 child.InitializeTimelineRecord(_mainTimelineId, recordId, _record.Id, ExecutionContextType.Task, displayName, refName, ++_childTimelineRecordOrder);
             }
+            if (logger != null)
+            {
+                child._logger = logger;
+            }
+            else
+            {
+                child._logger = HostContext.CreateService<IPagingLogger>();
+                child._logger.Setup(_mainTimelineId, recordId);
+            }
 
-            child._logger = HostContext.CreateService<IPagingLogger>();
-            child._logger.Setup(_mainTimelineId, recordId);
+            child.InsideComposite = insideComposite;
 
             return child;
         }
@@ -335,7 +351,7 @@ namespace GitHub.Runner.Worker
             }
 
             // report total delay caused by server throttling.
-            if (_totalThrottlingDelayInMilliseconds > 0)
+            if (_totalThrottlingDelayInMilliseconds > _throttlingDelayReportThreshold)
             {
                 this.Warning($"The job has experienced {TimeSpan.FromMilliseconds(_totalThrottlingDelayInMilliseconds).TotalSeconds} seconds total delay caused by server throttling.");
             }
@@ -363,14 +379,19 @@ namespace GitHub.Runner.Worker
                 }
             }
 
-            _cancellationTokenSource?.Dispose();
+            if (Root != this)
+            {
+                // only dispose TokenSource for step level ExecutionContext
+                _cancellationTokenSource?.Dispose();
+            }
 
             _logger.End();
 
-            if (!string.IsNullOrEmpty(ContextName))
+            // Skip if generated context name. Generated context names start with "__". After M271-ish the server will never send an empty context name.
+            if (!string.IsNullOrEmpty(ContextName) && !ContextName.StartsWith("__", StringComparison.Ordinal))
             {
-                StepsContext.SetOutcome(ScopeName, ContextName, (Outcome ?? Result ?? TaskResult.Succeeded).ToActionResult().ToString());
-                StepsContext.SetConclusion(ScopeName, ContextName, (Result ?? TaskResult.Succeeded).ToActionResult().ToString());
+                Global.StepsContext.SetOutcome(ScopeName, ContextName, (Outcome ?? Result ?? TaskResult.Succeeded).ToActionResult());
+                Global.StepsContext.SetConclusion(ScopeName, ContextName, (Result ?? TaskResult.Succeeded).ToActionResult());
             }
 
             return Result.Value;
@@ -429,7 +450,8 @@ namespace GitHub.Runner.Worker
         {
             ArgUtil.NotNullOrEmpty(name, nameof(name));
 
-            if (String.IsNullOrEmpty(ContextName))
+            // Skip if generated context name. Generated context names start with "__". After M271-ish the server will never send an empty context name.
+            if (string.IsNullOrEmpty(ContextName) || ContextName.StartsWith("__", StringComparison.Ordinal))
             {
                 reference = null;
                 return;
@@ -437,7 +459,7 @@ namespace GitHub.Runner.Worker
 
             // todo: restrict multiline?
 
-            StepsContext.SetOutput(ScopeName, ContextName, name, value, out reference);
+            Global.StepsContext.SetOutput(ScopeName, ContextName, name, value, out reference);
         }
 
         public void SetTimeout(TimeSpan? timeout)
@@ -571,42 +593,38 @@ namespace GitHub.Runner.Worker
 
             _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
 
-            // Features
-            Features = PlanUtil.GetFeatures(message.Plan);
+            Global = new GlobalContext();
+
+            // Plan
+            Global.Plan = message.Plan;
+            Global.Features = PlanUtil.GetFeatures(message.Plan);
 
             // Endpoints
-            Endpoints = message.Resources.Endpoints;
+            Global.Endpoints = message.Resources.Endpoints;
 
             // Variables
-            Variables = new Variables(HostContext, message.Variables);
+            Global.Variables = new Variables(HostContext, message.Variables);
 
             // Environment variables shared across all actions
-            EnvironmentVariables = new Dictionary<string, string>(VarUtil.EnvironmentVariableKeyComparer);
+            Global.EnvironmentVariables = new Dictionary<string, string>(VarUtil.EnvironmentVariableKeyComparer);
 
             // Job defaults shared across all actions
-            JobDefaults = new Dictionary<string, IDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+            Global.JobDefaults = new Dictionary<string, IDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
 
             // Job Outputs
             JobOutputs = new Dictionary<string, VariableValue>(StringComparer.OrdinalIgnoreCase);
 
+            // Actions environment
+            ActionsEnvironment = message.ActionsEnvironment;
+
             // Service container info
-            ServiceContainers = new List<ContainerInfo>();
+            Global.ServiceContainers = new List<ContainerInfo>();
 
             // Steps context (StepsRunner manages adding the scoped steps context)
-            StepsContext = new StepsContext();
-
-            // Scopes
-            Scopes = new Dictionary<String, ContextScope>(StringComparer.OrdinalIgnoreCase);
-            if (message.Scopes?.Count > 0)
-            {
-                foreach (var scope in message.Scopes)
-                {
-                    Scopes[scope.Name] = scope;
-                }
-            }
+            Global.StepsContext = new StepsContext();
 
             // File table
-            FileTable = new List<String>(message.FileTable ?? new string[0]);
+            Global.FileTable = new List<String>(message.FileTable ?? new string[0]);
 
             // Expression values
             if (message.ContextData?.Count > 0)
@@ -617,15 +635,15 @@ namespace GitHub.Runner.Worker
                 }
             }
 
-            ExpressionValues["secrets"] = Variables.ToSecretsContext();
+            ExpressionValues["secrets"] = Global.Variables.ToSecretsContext();
             ExpressionValues["runner"] = new RunnerContext();
             ExpressionValues["job"] = new JobContext();
 
             Trace.Info("Initialize GitHub context");
-            var githubAccessToken = new StringContextData(Variables.Get("system.github.token"));
+            var githubAccessToken = new StringContextData(Global.Variables.Get("system.github.token"));
             var base64EncodedToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"x-access-token:{githubAccessToken}"));
             HostContext.SecretMasker.AddValue(base64EncodedToken);
-            var githubJob = Variables.Get("system.github.job");
+            var githubJob = Global.Variables.Get("system.github.job");
             var githubContext = new GitHubContext();
             githubContext["token"] = githubAccessToken;
             if (!string.IsNullOrEmpty(githubJob))
@@ -648,7 +666,7 @@ namespace GitHub.Runner.Worker
 #endif
 
             // Prepend Path
-            PrependPath = new List<string>();
+            Global.PrependPath = new List<string>();
 
             // JobSteps for job ExecutionContext
             JobSteps = new Queue<IStep>();
@@ -674,10 +692,10 @@ namespace GitHub.Runner.Worker
             _logger.Setup(_mainTimelineId, _record.Id);
 
             // Initialize 'echo on action command success' property, default to false, unless Step_Debug is set
-            EchoOnActionCommand = Variables.Step_Debug ?? false;
+            EchoOnActionCommand = Global.Variables.Step_Debug ?? false;
 
             // Verbosity (from GitHub.Step_Debug).
-            WriteDebug = Variables.Step_Debug ?? false;
+            Global.WriteDebug = Global.Variables.Step_Debug ?? false;
 
             // Hook up JobServerQueueThrottling event, we will log warning on server tarpit.
             _jobServerQueue.JobServerQueueThrottling += JobServerQueueThrottling_EventReceived;
@@ -705,7 +723,7 @@ namespace GitHub.Runner.Worker
                 }
             }
 
-            _jobServerQueue.QueueWebConsoleLine(_record.Id, msg);
+            _jobServerQueue.QueueWebConsoleLine(_record.Id, msg, totalLines);
             return totalLines;
         }
 
@@ -840,6 +858,10 @@ namespace GitHub.Runner.Worker
             {
                 _record.ParentId = parentTimelineRecordId;
             }
+            else if (parentTimelineRecordId == null)
+            {
+                _record.AgentPlatform = VarUtil.OS;
+            }
 
             var configuration = HostContext.GetService<IConfigurationStore>();
             _record.WorkerName = configuration.GetSettings().AgentName;
@@ -851,7 +873,8 @@ namespace GitHub.Runner.Worker
         {
             Interlocked.Add(ref _totalThrottlingDelayInMilliseconds, Convert.ToInt64(data.Delay.TotalMilliseconds));
 
-            if (!_throttlingReported)
+            if (!_throttlingReported &&
+                _totalThrottlingDelayInMilliseconds > _throttlingDelayReportThreshold)
             {
                 this.Warning(string.Format("The job is currently being throttled by the server. You may experience delays in console line output, job status reporting, and action log uploads."));
 
@@ -877,6 +900,16 @@ namespace GitHub.Runner.Worker
     // Otherwise individual overloads would need to be implemented (depending on the unit test).
     public static class ExecutionContextExtension
     {
+        public static string GetFullyQualifiedContextName(this IExecutionContext context)
+        {
+            if (!string.IsNullOrEmpty(context.ScopeName))
+            {
+                return $"{context.ScopeName}.{context.ContextName}";
+            }
+
+            return context.ContextName;
+        }
+
         public static void Error(this IExecutionContext context, Exception ex)
         {
             context.Error(ex.Message);
@@ -887,6 +920,12 @@ namespace GitHub.Runner.Worker
         public static void Error(this IExecutionContext context, string message)
         {
             context.AddIssue(new Issue() { Type = IssueType.Error, Message = message });
+        }
+
+        // Do not add a format string overload. See comment on ExecutionContext.Write().
+        public static void InfrastructureError(this IExecutionContext context, string message)
+        {
+            context.AddIssue(new Issue() { Type = IssueType.Error, Message = message, IsInfrastructureIssue = true});
         }
 
         // Do not add a format string overload. See comment on ExecutionContext.Write().
@@ -915,7 +954,7 @@ namespace GitHub.Runner.Worker
         // Do not add a format string overload. See comment on ExecutionContext.Write().
         public static void Debug(this IExecutionContext context, string message)
         {
-            if (context.WriteDebug)
+            if (context.Global.WriteDebug)
             {
                 var multilines = message?.Replace("\r\n", "\n")?.Split("\n");
                 if (multilines != null)
@@ -940,7 +979,10 @@ namespace GitHub.Runner.Worker
                 traceWriter = context.ToTemplateTraceWriter();
             }
             var schema = PipelineTemplateSchemaFactory.GetSchema();
-            return new PipelineTemplateEvaluator(traceWriter, schema, context.FileTable);
+            return new PipelineTemplateEvaluator(traceWriter, schema, context.Global.FileTable)
+            {
+                MaxErrorMessageLength = int.MaxValue, // Don't truncate error messages otherwise we might not scrub secrets correctly
+            };
         }
 
         public static ObjectTemplating.ITraceWriter ToTemplateTraceWriter(this IExecutionContext context)

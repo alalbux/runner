@@ -14,7 +14,7 @@ Issues in this repository should be for the runner application.  Note that the V
 
 We ask that before significant effort is put into code changes, that we have agreement on taking the change before time is invested in code changes. 
 
-1. Create a feature request.  Once agreed we will take the enhancment
+1. Create a feature request.  Once agreed we will take the enhancement
 2. Create an ADR to agree on the details of the change.
 
 An ADR is an Architectural Decision Record.  This allows consensus on the direction forward and also serves as a record of the change and motivation.  [Read more here](adrs/README.md)
@@ -23,7 +23,7 @@ An ADR is an Architectural Decision Record.  This allows consensus on the direct
 
 ### Required Dev Dependencies
 
-![Win](res/win_sm.png) Git for Windows [Install Here](https://git-scm.com/downloads) (needed for dev sh script)
+![Win](res/win_sm.png) ![*nix](res/linux_sm.png)  Git for Windows and Linux [Install Here](https://git-scm.com/downloads) (needed for dev sh script)
 
 ### To Build, Test, Layout 
 
@@ -43,6 +43,7 @@ Sample developer flow:
 
 ```bash
 git clone https://github.com/actions/runner
+cd runner
 cd ./src
 ./dev.(sh/cmd) layout # the runner that built from source is in {root}/_layout
 <make code changes>
@@ -50,10 +51,23 @@ cd ./src
 ./dev.(sh/cmd) test # run all unit tests before git commit/push
 ```
 
+View logs:
+```bash
+cd runner/_layout/_diag
+ls
+cat (Runner/Worker)_TIMESTAMP.log # view your log file
+```
+
+Run Runner:
+```bash
+cd runner/_layout
+./run.sh # run your custom runner
+```
+
 ### Editors
 
 [Using Visual Studio Code](https://code.visualstudio.com/)
-[Using Visual Studio 2019](https://www.visualstudio.com/vs/)  
+[Using Visual Studio](https://code.visualstudio.com/docs)  
 
 ### Styling
 

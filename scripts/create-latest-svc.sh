@@ -22,12 +22,31 @@ set -e
 # PATS over envvars are more secure
 # Should be used on VMs and not containers
 # Works on OSX and Linux 
+# RUNNER_CFG_PAT=<yourPAT> ./create-latest-svc.sh myuser/myrepo my.ghe.deployment.net
+# RUNNER_CFG_PAT=<yourPAT> ./create-latest-svc.sh myorg my.ghe.deployment.net
+#
+# Usage:
+#     export RUNNER_CFG_PAT=<yourPAT>
+#     ./create-latest-svc scope [ghe_domain] [name] [user] [labels]
+#
+#      scope       required  repo (:owner/:repo) or org (:organization)
+#      ghe_domain  optional  the fully qualified domain name of your GitHub Enterprise Server deployment
+#      name        optional  defaults to hostname
+#      user        optional  user svc will run as. defaults to current
+#      labels      optional  list of labels (split by comma) applied on the runner
+#
+# Notes:
+# PATS over envvars are more secure
+# Should be used on VMs and not containers
+# Works on OSX and Linux
 # Assumes x64 arch
 #
 
 runner_scope=${1}
-runner_name=${2:-$(hostname)}
-svc_user=${3:-$USER}
+ghe_hostname=${2}
+runner_name=${3:-$(hostname)}
+svc_user=${4:-$USER}
+labels=${5}
 
 echo "Configuring runner @ ${runner_scope}"
 sudo echo
@@ -51,9 +70,11 @@ which curl || fatal "curl required.  Please install in PATH with apt-get, brew, 
 which jq || fatal "jq required.  Please install in PATH with apt-get, brew, etc"
 
 # bail early if there's already a runner there. also sudo early
-if [ -d ./runner ]; then 
+
+if [ -d ./runner ]; then
     fatal "Runner already exists.  Use a different directory or delete ./runner"
-fi 
+fi
+
 
 sudo -u ${svc_user} mkdir runner
 
@@ -67,14 +88,21 @@ echo
 echo "Generating a registration token..."
 
 # if the scope has a slash, it's an repo runner
-base_api_url="https://api.github.com/orgs"
-if [[ "$runner_scope" == *\/* ]]; then
-    base_api_url="https://api.github.com/repos"
+base_api_url="https://api.github.com"
+if [ -n "${ghe_hostname}" ]; then
+    base_api_url="https://${ghe_hostname}/api/v3"
 fi
 
-export RUNNER_TOKEN=$(curl -s -X POST ${base_api_url}/${runner_scope}/actions/runners/registration-token -H "accept: application/vnd.github.everest-preview+json" -H "authorization: token ${RUNNER_CFG_PAT}" | jq -r '.token')
+# if the scope has a slash, it's a repo runner
+orgs_or_repos="orgs"
+if [[ "$runner_scope" == *\/* ]]; then
+    orgs_or_repos="repos"
+fi
 
-if [ -z "$RUNNER_TOKEN" ]; then fatal "Failed to get a token"; fi 
+export RUNNER_TOKEN=$(curl -s -X POST ${base_api_url}/${orgs_or_repos}/${runner_scope}/actions/runners/registration-token -H "accept: application/vnd.github.everest-preview+json" -H "authorization: token ${RUNNER_CFG_PAT}" | jq -r '.token')
+
+if [ "null" == "$RUNNER_TOKEN" -o -z "$RUNNER_TOKEN" ]; then fatal "Failed to get a token"; fi
+
 
 #---------------------------------------
 # Download latest released and extract
@@ -116,10 +144,16 @@ pushd ./runner
 # Unattend config
 #---------------------------------------
 runner_url="https://github.com/${runner_scope}"
+
+if [ -n "${ghe_hostname}" ]; then
+    runner_url="https://${ghe_hostname}/${runner_scope}"
+fi
+
 echo
 echo "Configuring ${runner_name} @ $runner_url"
-echo "./config.sh --unattended --url $runner_url --token *** --name $runner_name"
-sudo -E -u ${svc_user} ./config.sh --unattended --url $runner_url --token $RUNNER_TOKEN --name $runner_name
+echo "./config.sh --unattended --url $runner_url --token *** --name $runner_name --labels $labels"
+sudo -E -u ${svc_user} ./config.sh --unattended --url $runner_url --token $RUNNER_TOKEN --name $runner_name --labels $labels
+
 
 #---------------------------------------
 # Configuring as a service
@@ -130,6 +164,7 @@ prefix=""
 if [ "${runner_plat}" == "linux" ]; then 
     prefix="sudo "
 fi 
+
 
 ${prefix}./svc.sh install ${svc_user}
 ${prefix}./svc.sh start
